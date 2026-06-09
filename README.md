@@ -49,7 +49,6 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local-dir ./mode
 ```
 
 ### 4. Extract talker weights
-
 ```bash
 python extract_weights.py --hf_model ./models/qwen3-tts-0.6b --out_dir ./models/qwen3-tts-0.6b
 ```

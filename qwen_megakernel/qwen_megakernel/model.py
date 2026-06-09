@@ -25,10 +25,17 @@ MAX_SEQ_LEN = 4096
 AUDIO_VOCAB_SIZE = 3072  # codec token vocab (talker output)
 TEXT_EMBED_DIM = 2048    # text_embedding output dim before projection
 
-# Special token ids (from config.json)
-CODEC_BOS_ID   = 2149
-CODEC_EOS_ID   = 2150
-CODEC_PAD_ID   = 2148
+# Special token ids (from talker_config in config.json)
+CODEC_BOS_ID      = 2149
+CODEC_EOS_ID      = 2150
+CODEC_PAD_ID      = 2148
+CODEC_THINK_ID    = 2154
+CODEC_NOTHINK_ID  = 2155
+CODEC_THINK_BOS_ID = 2156
+CODEC_THINK_EOS_ID = 2157
+TTS_TEXT_BOS_ID   = 151672  # <tts_text_bos>
+TTS_TEXT_EOD_ID   = 151673  # <tts_text_eod>
+TTS_TEXT_PAD_ID   = 151671  # <tts_pad>
 LANGUAGE_IDS = {
     "english":    2050,
     "chinese":    2055,
@@ -63,8 +70,9 @@ def load_weights(model_path: str, verbose: bool = True):
                     state[k] = f.get_tensor(k).cuda().to(torch.bfloat16)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3-0.6B",  # reuse Qwen3 text tokenizer
+        model_path,
         trust_remote_code=True,
+        fix_mistral_regex=True,
     )
 
     # RoPE tables for audio token positions (standard RoPE for decode loop)
@@ -195,10 +203,11 @@ class TalkerDecoder:
         self._bmax_idxs = torch.empty(4096, dtype=torch.int32, device="cuda")
         self._out_token = torch.empty(1, dtype=torch.int32, device="cuda")
 
-    def _text_embed_and_project(self, token_ids: list[int]) -> torch.Tensor:
-        """Embed text tokens [seq] → project to [seq, 1024] (talker hidden dim)."""
-        ids = torch.tensor(token_ids, dtype=torch.long, device="cuda")
-        x = self._text_embedding[ids].to(torch.float32)          # [seq, 2048]
+    def _text_embed_and_project(self, token_ids) -> torch.Tensor:
+        """Embed text tokens → project to [seq, 1024] (talker hidden dim)."""
+        if not isinstance(token_ids, torch.Tensor):
+            token_ids = torch.tensor(token_ids, dtype=torch.long, device="cuda")
+        x = self._text_embedding[token_ids].to(torch.float32)    # [seq, 2048]
         x = F.linear(x, self._text_proj_fc1_w.float(), self._text_proj_fc1_b.float())
         x = F.silu(x)
         x = F.linear(x, self._text_proj_fc2_w.float(), self._text_proj_fc2_b.float())
@@ -221,8 +230,6 @@ class TalkerDecoder:
         # Embed text tokens via text_embedding + projection
         hidden = self._text_embed_and_project(full_ids)  # [seq, 1024]
 
-        # Run prefill through the 28 transformer layers in PyTorch
-        # (uses the same weights as the megakernel — KV cache is shared)
         with torch.no_grad():
             self._pytorch_prefill(hidden)
 
@@ -258,7 +265,7 @@ class TalkerDecoder:
             v = v.reshape(seq_len,  8, HEAD_DIM)
 
             # Apply RoPE
-            positions = torch.arange(seq_len, device="cuda")
+            positions = torch.arange(seq_len, device=hidden.device)
             q = _apply_rope(q, self._cos_table, self._sin_table, positions)
             k = _apply_rope(k, self._cos_table, self._sin_table, positions)
 
@@ -340,7 +347,7 @@ class TalkerDecoder:
         token = CODEC_BOS_ID
         for _ in range(max_tokens):
             token = self.step(token)
-            if token == CODEC_EOS_ID:
+            if token >= 2048:   # EOS, PAD, special tokens — all signal end
                 break
             codes = self._code_predictor.step(
                 g0_token=token,

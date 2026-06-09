@@ -15,11 +15,14 @@ import torch
 
 
 def write_wav(path: str, pcm_bytes: bytes, sample_rate: int = 24000):
-    """Write raw float32 PCM bytes → 16-bit PCM WAV."""
+    """Write raw float32 PCM bytes → 16-bit PCM WAV (peak-normalized)."""
     import array, wave
     import numpy as np
 
-    samples = np.frombuffer(pcm_bytes, dtype=np.float32)
+    samples = np.frombuffer(pcm_bytes, dtype=np.float32).copy()
+    peak = np.max(np.abs(samples))
+    if peak > 1e-6:
+        samples = samples / peak * 0.95   # normalize to 95% full scale
     samples = np.clip(samples, -1.0, 1.0)
     pcm16 = (samples * 32767).astype(np.int16)
 
@@ -34,7 +37,7 @@ def write_wav(path: str, pcm_bytes: bytes, sample_rate: int = 24000):
     return duration
 
 
-def run(model_path: str, text: str, out_path: str, temperature: float = 0.0):
+def run(model_path: str, text: str, out_path: str, temperature: float = 0.0, max_frames: int = 2048):
     print(f"\n{'='*50}")
     print(f"  Model  : {model_path}")
     print(f"  Text   : {text!r}")
@@ -59,7 +62,7 @@ def run(model_path: str, text: str, out_path: str, temperature: float = 0.0):
     all_pcm = bytearray()
     frame_times = []
 
-    for frame_idx, codes in enumerate(talker.generate_frames(text, temperature=temperature)):
+    for frame_idx, codes in enumerate(talker.generate_frames(text, temperature=temperature, max_tokens=max_frames)):
         t_frame = time.perf_counter()
 
         codes_t = torch.tensor([codes], dtype=torch.long)   # [1, 16] CPU
@@ -105,6 +108,7 @@ if __name__ == "__main__":
     parser.add_argument("--text",  default="Hello, this is a test of the Qwen3 TTS megakernel.")
     parser.add_argument("--out",   default="/tmp/sample.wav")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max_frames", type=int, default=2048)
     args = parser.parse_args()
 
-    run(args.model, args.text, args.out, args.temperature)
+    run(args.model, args.text, args.out, args.temperature, args.max_frames)
