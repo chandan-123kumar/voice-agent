@@ -112,6 +112,18 @@ def load_weights(model_path: str, verbose: bool = True):
         text_proj_fc2_b=state["talker.text_projection.linear_fc2.bias"].contiguous(),
     )
 
+    # Code predictor weights (keep as raw dict for CodePredictor to consume)
+    cp_weights = {}
+    for fname in sorted(os.listdir(model_path)):
+        if fname.endswith(".safetensors"):
+            fpath = os.path.join(model_path, fname)
+            with safe_open(fpath, framework="pt") as f:
+                for k in f.keys():
+                    if "code_predictor" in k:
+                        cp_weights[k] = f.get_tensor(k).cuda().to(torch.bfloat16)
+
+    weights["cp_weights"] = cp_weights
+
     del state
     torch.cuda.empty_cache()
     return weights, tokenizer
@@ -137,10 +149,12 @@ class TalkerDecoder:
     """
 
     def __init__(self, model_path: str, verbose: bool = True):
+        from qwen_megakernel.code_predictor import CodePredictor
         weights, tokenizer = load_weights(model_path, verbose=verbose)
         self.tokenizer = tokenizer
         self._position = 0
         self._weights = weights
+        self._code_predictor = CodePredictor(weights["cp_weights"])
 
         # Megakernel weights
         self._embed_weight       = weights["embed_weight"]
@@ -313,10 +327,33 @@ class TalkerDecoder:
                 break
             yield token
 
+    def generate_frames(
+        self,
+        text: str,
+        language: str = "english",
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+    ):
+        """Yield [16]-code frames until EOS. Each frame = one codec time step."""
+        self.prefill(text, language=language)
+        self._code_predictor.reset()
+        token = CODEC_BOS_ID
+        for _ in range(max_tokens):
+            token = self.step(token)
+            if token == CODEC_EOS_ID:
+                break
+            codes = self._code_predictor.step(
+                g0_token=token,
+                talker_embed_weight=self._embed_weight,
+                temperature=temperature,
+            )
+            yield codes
+
     def reset(self):
         self._position = 0
         self._k_cache.zero_()
         self._v_cache.zero_()
+        self._code_predictor.reset()
 
     @property
     def position(self) -> int:

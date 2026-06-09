@@ -44,20 +44,54 @@ CUDA_FLAGS = [
 ] + KERNEL_FLAGS
 
 
+def _find_cached_so():
+    """Locate any pre-built qwen_megakernel_C.so across all cache variants."""
+    base = os.path.join(os.path.expanduser("~"), ".cache", "torch_extensions")
+    if not os.path.isdir(base):
+        return None
+    for variant in sorted(os.listdir(base), reverse=True):
+        so = os.path.join(base, variant, "qwen_megakernel_C", "qwen_megakernel_C.so")
+        if os.path.exists(so):
+            return so
+    return None
+
+
 def get_extension():
     """Build (or return cached) the megakernel extension. Triggers torch.ops.qwen_megakernel_C.*"""
+    import torch
     global _module
     if _module is not None:
         return _module
 
-    _module = load(
-        name="qwen_megakernel_C",
-        sources=[
-            os.path.join(_CSRC, "torch_bindings.cpp"),
-            os.path.join(_CSRC, "kernel.cu"),
-        ],
-        extra_cuda_cflags=CUDA_FLAGS,
-        extra_cflags=[f"-I{_CSRC}"],
-        verbose=False,
-    )
+    # Fast path: load pre-built .so directly if it exists
+    cached_so = _find_cached_so()
+    if cached_so is not None:
+        try:
+            torch.ops.load_library(cached_so)
+            _module = True
+            return _module
+        except OSError:
+            pass  # stale .so (wrong ABI); fall through to rebuild
+
+    # Slow path: JIT build — patch _get_cuda_arch_flags so sm_120a isn't rejected
+    import torch.utils.cpp_extension as _cext
+    _orig = _cext._get_cuda_arch_flags
+
+    def _patched_arch_flags(cflags=None):
+        return []  # we provide -arch=sm_120a explicitly
+
+    _cext._get_cuda_arch_flags = _patched_arch_flags
+    try:
+        _module = load(
+            name="qwen_megakernel_C",
+            sources=[
+                os.path.join(_CSRC, "torch_bindings.cpp"),
+                os.path.join(_CSRC, "kernel.cu"),
+            ],
+            extra_cuda_cflags=CUDA_FLAGS,
+            extra_cflags=[f"-I{_CSRC}"],
+            verbose=True,
+        )
+    finally:
+        _cext._get_cuda_arch_flags = _orig
     return _module

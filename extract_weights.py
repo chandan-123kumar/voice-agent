@@ -9,7 +9,7 @@
 import argparse
 from pathlib import Path
 
-
+python3 -m qwen_megakernel.bench                          
 # Expected talker weight shapes (from config.json inspection):
 #   Q proj:        [2048, 1024]   (16 heads × 128 dim)
 #   K/V proj:      [1024, 1024]   (8 kv_heads × 128 dim)
