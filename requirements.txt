@@ -1,0 +1,11 @@
+# RTX 5090 (server)
+torch>=2.4.0
+pipecat-ai[deepgram,openai]
+transformers>=4.57.0
+safetensors
+descript-audio-codec
+numpy
+
+# Local client
+websockets
+pyaudio

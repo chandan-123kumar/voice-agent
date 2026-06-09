@@ -14,20 +14,21 @@ The "12Hz" codec rate means each generated token = **~83ms of audio**. At 1,000 
 
 ## Critical Kernel Differences (Qwen3-0.6B vs Talker)
 
-From `config.json` of the HF model:
+From inspecting the actual kernel source (`qwen_megakernel/csrc/kernel.cu`) and the talker `config.json`:
 
-| Parameter            | Qwen3-0.6B (kernel default) | Talker config       |
+| Parameter            | Kernel (`kernel.cu`)        | Talker config       |
 |----------------------|-----------------------------|---------------------|
-| `hidden_size`        | 1024                        | 1024 ✓              |
-| `num_hidden_layers`  | 28                          | 28 ✓                |
-| `num_attention_heads`| 16                          | 16 ✓                |
-| `num_kv_heads`       | 8                           | 8 ✓                 |
-| `head_dim`           | 128                         | 128 ✓               |
-| `intermediate_size`  | **2816**                    | **3072** ✗          |
-| output `vocab_size`  | 151936 (text)               | **3072** (audio) ✗  |
+| `HIDDEN_SIZE`        | 1024                        | 1024 ✓              |
+| `NUM_LAYERS`         | 28                          | 28 ✓                |
+| `NUM_Q_HEADS`        | 16                          | 16 ✓                |
+| `NUM_KV_HEADS`       | 8                           | 8 ✓                 |
+| `HEAD_DIM`           | 128                         | 128 ✓               |
+| `INTERMEDIATE_SIZE`  | **3072** ✓                  | **3072** ✓          |
+| `LDG_VOCAB_SIZE`     | **151936** (text)           | **3072** (audio) ✗  |
 | RoPE type            | standard                    | **M-RoPE** [24,20,20] ✗ |
+| LM head              | tied to embed_tokens        | separate projection ✗ |
 
-The FFN size change (2816 → 3072) affects every weight matrix in the up/gate/down projections across all 28 layers. The vocab change shrinks the LM head significantly. M-RoPE requires a sectioned position encoding implementation.
+**Good news**: `INTERMEDIATE_SIZE` is already 3072 — no FFN changes needed. Only two kernel modifications are required: the LM head vocab size and the RoPE implementation.
 
 ---
 
@@ -86,35 +87,31 @@ text input
 
 ---
 
-## Phase 3 — Kernel Modification (est. 3–5 hrs)
+## Phase 3 — Kernel Modification (est. 2–3 hrs)
 
-Four changes to `csrc/megakernel.cu`:
+Two changes to `qwen_megakernel/csrc/kernel.cu` (INTERMEDIATE_SIZE is already correct at 3072):
 
-### 3a. FFN Intermediate Size: 2816 → 3072
-- Find the `INTERMEDIATE` constant (or equivalent `#define`)
-- Update to 3072
-- Audit all tiled matmul calls that reference this constant
-- Verify tile size divides 3072 evenly (3072 = 2^10 × 3 — use 256-element tiles; pad if needed)
-- Re-run the bench to confirm no regression in kernel correctness
+### 3a. LM Head Vocab: 151936 → 3072
+- Change `LDG_VOCAB_SIZE` from 151936 → 3072
+- The LM head kernel (`lm_head_kernel`) launches with `LDG_LM_NUM_BLOCKS=1184` and `LDG_LM_BLOCK_SIZE=256` — re-tune these for the much smaller 3072-row projection
+- In `model.py`: the original uses tied embeddings (`lm_head_weight = embed_weight`). The talker has a separate LM head; load `model.talker.lm_head.weight` instead
+- The LM head being 50× smaller should make this stage essentially free
 
-### 3b. LM Head Vocab: 151936 → 3072
-- Update the output projection dimension constant
-- The LM head is much smaller now — should be faster
-- Adjust any shared-memory or register allocations that were sized for the larger vocab
+### 3b. M-RoPE (Multimodal RoPE)
+- The talker uses `mrope_section: [24, 20, 20]` over the 128-dim head:
+  - Dims 0–23: text sequence position
+  - Dims 24–43: audio time position
+  - Dims 44–63: zero (padding section)
+- In the kernel: replace the `apply_rope` device function with an M-RoPE variant that applies different position frequencies per section
+- In `model.py`: generate separate cos/sin tables per section instead of one unified table; pass as three pairs to the kernel
+- Validate a single forward pass against HF reference output before running any perf benchmarks
 
-### 3c. M-RoPE (Multimodal RoPE)
-- The talker uses `mrope_section: [24, 20, 20]` over the 128-dim head
-  - Dims 0–23: text position encoding
-  - Dims 24–43: time position encoding
-  - Dims 44–63: reserved/padding
-- Replace the existing `apply_rope` device function with a sectioned variant
-- Validate against a single HF reference forward pass before benchmarking
-
-### 3d. Input Embeddings (host-side, no kernel change needed)
-- Handle embedding lookup in Python: text tokens → `[seq_len, 1024]` tensor
-- Inject speaker embedding at the designated position
-- Pass the pre-embedded `[seq_len, 1024]` activation tensor directly into the kernel
-- This keeps the kernel interface clean and avoids adding a second vocab table
+### 3c. Weight Loading (host-side, `model.py`)
+- Change `load_weights()` to load from `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` and pull the `model.talker.*` sub-tree
+- Embedding table: load `model.talker.embed_tokens.weight` (covers both text and audio vocab)
+- LM head: load `model.talker.lm_head.weight` (NOT tied; separate tensor)
+- All 28 layer weight keys change prefix from `model.layers.{i}.` → `model.talker.layers.{i}.`
+- All other tensor names within each layer are identical (q_proj, k_proj, mlp.gate_proj, etc.)
 
 ---
 
@@ -287,7 +284,7 @@ Instrument with `time.perf_counter_ns()` at each boundary:
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Tile size doesn't divide 3072 cleanly | Medium | 3072 = 1024×3; use 256-tile with padding to next power-of-2 boundary |
+| LM head block config after vocab shrink | Low | Re-tune `LDG_LM_NUM_BLOCKS` downward from 1184; smaller vocab = fewer blocks needed |
 | M-RoPE correctness | High | Validate single step against HF reference before any perf work |
 | Code predictor latency spikes RTF | Low | It's 5-layer non-autoregressive; if >10ms, run it on a CUDA stream parallel to the next talker decode step |
 | Audio decoder not bundled in megakernel repo | Certain | Use `qwen-tts` library vocoder or `descript-audio-codec` |
@@ -300,20 +297,22 @@ Instrument with `time.perf_counter_ns()` at each boundary:
 
 ```
 voice_agent/
-├── plan.md                          # this file
-├── csrc/
-│   └── megakernel.cu                # modified kernel (3072 FFN, 3072 vocab, M-RoPE)
-├── qwen_megakernel/
-│   ├── model.py                     # weight loading for talker
-│   ├── generate.py                  # autoregressive decode loop
-│   └── bench.py                     # benchmark script
-├── tts_server.py                    # MegakernelTTSServer (async generator)
-├── extract_weights.py               # HF → megakernel weight remapping
+├── plan.md                              # this file
+├── qwen_megakernel/                     # cloned from AlpinDale/qwen_megakernel
+│   ├── csrc/
+│   │   ├── kernel.cu                    # MODIFIED: LDG_VOCAB_SIZE=3072, M-RoPE
+│   │   └── torch_bindings.cpp
+│   └── qwen_megakernel/
+│       ├── model.py                     # MODIFIED: talker weight loading, separate LM head
+│       ├── bench.py                     # benchmark script (reuse, point at TTS model)
+│       └── build.py
+├── tts_server.py                        # MegakernelTTSServer (async generator)
+├── extract_weights.py                   # (optional) HF weight inspection helper
 ├── services/
-│   └── qwen_megakernel_tts.py       # Pipecat TTSService subclass
-├── pipeline.py                      # full STT → LLM → TTS Pipecat pipeline (runs on RTX 5090)
-├── client.py                        # local WebSocket client: mic input + speaker output
-├── benchmark.py                     # TTFC / RTF / E2E measurement script
+│   └── qwen_megakernel_tts.py           # Pipecat TTSService subclass
+├── pipeline.py                          # full STT → LLM → TTS pipeline (runs on RTX 5090)
+├── client.py                            # local WebSocket client: mic input + speaker output
+├── benchmark.py                         # TTFC / RTF / E2E measurement script
 ├── requirements.txt
 └── README.md
 ```
