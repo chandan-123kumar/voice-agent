@@ -229,9 +229,10 @@ class TalkerDecoder:
             x = _rms_norm(hidden, rms_w)
 
             # QKV projections
-            q = F.linear(x, q_w.float())               # [seq, 2048]
-            k = F.linear(x, k_w.float())               # [seq, 1024]
-            v = F.linear(x, v_w.float())               # [seq, 1024]
+            x_f = x.float()
+            q = F.linear(x_f, q_w.float())             # [seq, 2048]
+            k = F.linear(x_f, k_w.float())             # [seq, 1024]
+            v = F.linear(x_f, v_w.float())             # [seq, 1024]
 
             # QK norms
             q = _rms_norm(q.reshape(seq_len, 16, HEAD_DIM), q_norm_w).reshape(seq_len, -1)
