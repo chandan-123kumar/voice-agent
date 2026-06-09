@@ -238,14 +238,19 @@ class TalkerDecoder:
             q = _rms_norm(q.reshape(seq_len, 16, HEAD_DIM), q_norm_w).reshape(seq_len, -1)
             k = _rms_norm(k.reshape(seq_len, 8,  HEAD_DIM), k_norm_w).reshape(seq_len, -1)
 
+            # Reshape for heads before RoPE
+            q = q.reshape(seq_len, 16, HEAD_DIM)
+            k = k.reshape(seq_len,  8, HEAD_DIM)
+            v = v.reshape(seq_len,  8, HEAD_DIM)
+
             # Apply RoPE
             positions = torch.arange(seq_len, device="cuda")
-            q = _apply_rope(q.reshape(seq_len, 16, HEAD_DIM), self._cos_table, self._sin_table, positions)
-            k = _apply_rope(k.reshape(seq_len, 8,  HEAD_DIM), self._cos_table, self._sin_table, positions)
+            q = _apply_rope(q, self._cos_table, self._sin_table, positions)
+            k = _apply_rope(k, self._cos_table, self._sin_table, positions)
 
             # Store in KV cache
             self._k_cache[i, :, :seq_len, :] = k.permute(1, 0, 2).to(torch.bfloat16)
-            self._v_cache[i, :, :seq_len, :] = v.reshape(seq_len, 8, HEAD_DIM).permute(1, 0, 2).to(torch.bfloat16)
+            self._v_cache[i, :, :seq_len, :] = v.permute(1, 0, 2).to(torch.bfloat16)
 
             # Attention (causal)
             attn_out = _causal_attention(q, k, v, self._attn_scale)  # [seq, 2048]
